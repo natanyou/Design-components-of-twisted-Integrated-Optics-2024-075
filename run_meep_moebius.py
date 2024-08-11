@@ -1,0 +1,177 @@
+import sys, os, gc
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+import meep as mp
+import numpy as np
+import pickle
+import argparse
+from mpi4py import MPI
+import h5py
+import setuptools
+import pyximport
+# pyximport.install(language_level=3,
+#                   reload_support=False)
+from material_function import moebius_eps_func
+
+
+output_dir = 'outputs'
+
+parser = argparse.ArgumentParser()
+parser.add_argument('nco', type=float)
+parser.add_argument('ncl', type=float)
+parser.add_argument('angle', type=float)
+parser.add_argument('radius', type=float)
+parser.add_argument('width', type=float)
+parser.add_argument('height', type=float)
+parser.add_argument('wl', type=float)
+parser.add_argument('resolution', type=int, default=1)
+parser.add_argument('--nslices', type=int, default=3)
+parser.add_argument('--until', type=float, default=None)
+parser.add_argument('--bandwidth', type=float, default=None)
+parser.add_argument('--nfreq', type=float, default=100)
+args = parser.parse_args()
+
+
+def moebius_strip(nco, ncl, width, height, radius, angle):
+
+    width = float(width)
+    height = float(height)
+    angle = float(angle)
+    radius = float(radius)
+    eps1 = nco ** 2
+    eps0 = ncl ** 2
+
+    def tg_eps_func(point: mp.Vector3):
+        def wrapper(point):
+            x = point.x
+            y = point.y
+            z = point.z
+            return moebius_eps_func(eps1, eps0, width, height, radius, angle, x, y, z)
+        return wrapper(point)
+
+    return tg_eps_func
+
+
+def create_simulation(nco, ncl, width, height, radius, angle, wl, bw, nfreq, resolution):
+    tg = moebius_strip(nco, ncl, width, height, radius, angle)
+    dpml = 1
+
+    global nonpml_vol, cell_size, cell_center, cell_volume, sz, sxy
+    sxy = 2 * radius * 1.2
+    sz = 1.7 * max(width, height)
+    cell_center = mp.Vector3(0, 0, 0)
+    cell_size = mp.Vector3(sxy + 2 * dpml, sxy + 2 * dpml, sz + 2 * dpml)
+    cell_volume = mp.Volume(center=cell_center, size=cell_size)
+    nonpml_vol = mp.Volume(center=cell_center, size=mp.Vector3(sxy, sxy, sz))
+
+    geometry = [mp.Block(center=cell_center,
+                         size=mp.Vector3(2 * radius, 2 * radius, max(width,height)),
+                         material=tg)]
+
+    beta = nco / wl
+    sources = [mp.EigenModeSource(mp.GaussianSource(wavelength=wl, width=bw, cutoff=2),
+                                  center=mp.Vector3(x=radius),
+                                  size=mp.Vector3(sz, 0, sz),
+                                  eig_match_freq=True,
+                                  eig_kpoint=mp.Vector3(y=beta),
+                                  eig_band=1,
+                                  eig_resolution=resolution)]
+
+    pml_layers = [mp.PML(thickness=dpml)]
+    filename_prefix = "moebius-{:.0f}x{:.0f}-R{:.0f}".format(width, height, radius)
+    sim = mp.Simulation(cell_size,
+                        resolution=resolution,
+                        epsilon_func=tg,
+                        geometry_center=cell_center,
+                        sources=sources,
+                        force_complex_fields=False,
+                        boundary_layers=pml_layers,
+                        filename_prefix=filename_prefix,
+                        output_volume=nonpml_vol)
+    sim.use_output_directory(output_dir)
+    sim.filename_prefix = filename_prefix
+    return sim
+
+
+def main(args):
+    nco, ncl = args.nco, args.ncl
+    angle = args.angle
+    radius = args.radius
+    width = args.width
+    height = args.height
+    wl = args.wl
+    freq = 1 / wl
+    bandwidth = args.bandwidth
+    if bandwidth is None:
+        bandwidth = 40 * args.wl
+    nfreq = args.nfreq 
+    resolution = args.resolution
+    nslices = args.nslices
+    until = args.until
+    sys.stdout.write('Starting simulation with parameters:\n')
+    sys.stdout.write('  nco, ncl = {}, {}\n'.format(nco, ncl))
+    sys.stdout.write('  angle = {} deg\n'.format(angle))
+    sys.stdout.write('  radius = {}\n'.format(radius))
+    sys.stdout.write('  width x height = {} x {}\n'.format(width, height))
+    sys.stdout.write('  wavelength = {:.4g}\n'.format(wl))
+    sys.stdout.write('  bandwidth = {:.4g}\n'.format(bandwidth))
+    sys.stdout.write('====================================\n')
+    sim = create_simulation(nco, ncl, width, height, radius, angle, wl, bandwidth, nfreq, resolution)
+    dft_slices = []
+    zs = [0]
+    comps = dict(Ex=mp.Ex, Ey=mp.Ey, Ez=mp.Ez, Hx=mp.Hx, Hy=mp.Hy, Hz=mp.Hz)
+    df = (1/wl ** 2)*bandwidth
+    for z in zs:
+        dft_slice = sim.add_dft_fields(list(comps.values()),
+                                       freq, 0, 1,
+                                       center=mp.Vector3(z=z),
+                                       size=mp.Vector3(sxy, sxy))
+        dft_slices.append(dft_slice)
+
+
+    dft_point = sim.add_dft_fields(list(comps.values()),
+                                       freq, df, nfreq,
+                                       center=mp.Vector3(x=-radius-(width/2),y=0,z=0),
+                                       size=mp.Vector3(0, 0))
+    # Create name for the HDF5 file
+    #========================================
+    filename = os.path.join(output_dir, sim.filename_prefix + '.h5')
+
+    # By default, run simulation until the excited wavepacket
+    # passes through the whole waveguide
+    #=======================================
+    if not until:
+        sim.run(until_after_sources=1.5 * nco * 2 * np.pi * radius)
+    else:
+        sim.run(until=until)
+
+    sys.stdout.write('Saving DFT fields\n')
+    with h5py.File(filename, 'w', driver='mpio', comm=MPI.COMM_WORLD) as f:
+        nx, ny = sim.get_dft_array(dft_slices[0], mp.Ex, 0).shape
+        nz = len(zs)
+        f.create_group("slice")
+        x, y, z, w = sim.get_array_metadata(vol=nonpml_vol)
+        f["slice"].create_dataset("x", data=x)
+        f["slice"].create_dataset("y", data=y)
+        f["slice"].create_dataset("z", data=z)
+        f.create_group("spectrum")
+        for comp, mpcomp in comps.items():
+            f["slice"].create_dataset(comp,
+                             shape=(nx, ny, nz),
+                             dtype=np.complex64, chunks=(nx, ny, 1))
+            for i in range(nz):
+                arr = sim.get_dft_array(dft_slices[i], mpcomp, 0)
+                if mp.am_master():
+                    f["slice"][comp][:, :, i] = arr
+            spectrum = np.zeros(nfreq, dtype=np.complex64)
+            for i in range(nfreq):
+                spectrum[i] = sim.get_dft_array(dft_point, mpcomp, i)
+            f["spectrum"].create_dataset(comp, data=spectrum)
+            sys.stdout.write('Saved {}\n'.format(comp))
+    sys.stdout.write('\nDFT fields saved to {}\n'.format(filename))
+
+
+if __name__ == '__main__':
+    SLURM_JOBID = os.environ.get('SLURM_JOBID')
+    if SLURM_JOBID:
+        sys.stdout.write("JOBID: {}\n".format(SLURM_JOBID))
+    main(args)
