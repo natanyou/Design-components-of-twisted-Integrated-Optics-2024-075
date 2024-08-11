@@ -1,0 +1,51 @@
+% Parameters
+R = 100 / (2 * pi); % Radius of the central circle based on length l=100
+w = 3; % Width of the strip
+h = 2; % Height of the strip
+
+% Discretize the parameters
+u = linspace(0, 2*pi, 200);
+v = linspace(-w/2, w/2, 100);
+[U, V] = meshgrid(u, v);
+
+% Parametric equations for the Möbius ring
+X = (R + V .* cos(U/2)) .* cos(U);
+Y = (R + V .* cos(U/2)) .* sin(U);
+Z = V .* sin(U/2) * h;
+
+% Calculate epsilon values (0 inside, 1 outside the ring)
+epsilon = zeros(size(U));
+inside = abs(V) <= w/2; % Inside the ring
+epsilon(~inside) = 1; % Outside the ring
+
+% Plotting the Möbius ring
+figure;
+surf(X, Y, Z, epsilon, 'FaceColor', 'interp', 'EdgeColor', 'none');
+hold on;
+
+% Marking the outlines
+% Outline 1: v = -w/2
+v_outline = -w/2;
+X_outline1 = (R + v_outline .* cos(u/2)) .* cos(u);
+Y_outline1 = (R + v_outline .* cos(u/2)) .* sin(u);
+Z_outline1 = v_outline .* sin(u/2) * h;
+plot3(X_outline1, Y_outline1, Z_outline1, 'k', 'LineWidth', 2);
+
+% Outline 2: v = w/2
+v_outline = w/2;
+X_outline2 = (R + v_outline .* cos(u/2)) .* cos(u);
+Y_outline2 = (R + v_outline .* cos(u/2)) .* sin(u);
+Z_outline2 = v_outline .* sin(u/2) * h;
+plot3(X_outline2, Y_outline2, Z_outline2, 'k', 'LineWidth', 2);
+
+% Final plot adjustments
+axis equal;
+xlabel('X');
+ylabel('Y');
+zlabel('Z');
+title('3D Möbius Ring with Outlines');
+colormap('jet');
+colorbar;
+shading interp;
+view(3);
+hold off;

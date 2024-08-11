@@ -1,0 +1,166 @@
+clear all;
+jcm_root = "C:\Users\natanyou\AppData\Roaming\JCMwave\JCMsuite";
+addpath(fullfile(jcm_root, 'ThirdPartySupport', 'Matlab'));
+
+
+%%
+%---------------------------Basic parameters---------------------------%
+height = 1;
+width = 3;
+l_arr = [1 10 30 50 80 100]*10^-3;
+l = l_arr(2);
+lambda = 1.55*10^-6;
+N = 100;
+alpha_max = 628;                                                                    % max twist rate [rad/micro-meter]
+alpha_t = linspace(0, alpha_max, N); 
+twist_angle_max = alpha_max*l;                                                      % max twist angle of entire waveguide
+twist_angle_t = alpha_t*l;                                                          % twist angle array of entire waveguide
+
+%%
+%-------------------------Simulate\Load fieldbags-------------------------%
+while true
+    answer = input('Enter: \n 1 - to simulate fieldbags (will override existing fieldbags in folder) \n 2 - to load fieldbags \n');
+    if answer == 1
+        keys.clad_n = 1.5168;
+        keys.core_n = 1.531968;
+        keys.alpha = 0;
+        keys.guess = keys.core_n;
+        results = jcmwave_solve('project.jcmp', keys); % find modes with JCM
+        cfb = results{2};          
+        amplitude = cfb.field{2};
+        save('amplitude.mat','amplitude');
+        Ex = real(amplitude(:,:,1));                   
+        Ey = real(amplitude(:,:,2));
+        sizes = size(amplitude);
+        x = linspace(0, 1, sizes(1));
+        y = linspace(0, 1, sizes(2));
+        intensity = sum(conj(amplitude).*amplitude, 3);
+        max_abs = max(max(abs([Ex Ey])));
+        clims = [-max_abs max_abs];
+        save('clims.mat','clims');
+        
+        guess_from_presolve = real((results{1}.eigenvalues.effective_refractive_index(1))); % initial guess
+        guess = guess_from_presolve;
+        
+        EM_fields_mode_1 = ones(sizes(1),sizes(2),4,N);                                     % electric fields (mat 1 ex and 2 ey) and magnetic fields (mat 3 hx and 4 hy)
+        EM_fields_mode_2 = ones(sizes(1),sizes(2),4,N);                                     % electric fields (mat 1 ex and 2 ey) and magnetic fields (mat 3 hx and 4 hy)
+        neff_jcm = zeros(2, N);                                                             % array for n_eff2 values
+        
+        % solution for electric and magnetic fields
+        for i = 1:N
+            keys.alpha = alpha_t(i);                                                        % set twist rate for current itaration guess
+            keys.guess = guess;                                                             % set current as previous n_eff1 found,or initial guess for i==1
+            results = jcmwave_solve('project.jcmp', keys);                                  % find modes with JCM
+            cfbE = results{2};
+            cfbH = results{3};
+            amplitude_mode_1 = cfbE.field{1};
+            amplitude_mode_2 = cfbE.field{2}; 
+            EM_fields_mode_1(:,:,1,i) = amplitude_mode_1(:,:,1);                            % Ex mode 1
+            EM_fields_mode_1(:,:,2,i) = amplitude_mode_1(:,:,2);                            % Ey mode 1
+            EM_fields_mode_2(:,:,1,i) = amplitude_mode_2(:,:,1);                            % Ex mode 2
+            EM_fields_mode_2(:,:,2,i) = amplitude_mode_2(:,:,2);                            % Ey mode 2
+            amplitude_mode_1 = cfbH.field{1};
+            amplitude_mode_2 = cfbH.field{2};
+            EM_fields_mode_1(:,:,3,i) = amplitude_mode_1(:,:,1);                            % Hx mode 1
+            EM_fields_mode_1(:,:,4,i) = amplitude_mode_1(:,:,2);                            % Hy mode 1
+            EM_fields_mode_2(:,:,3,i) = amplitude_mode_2(:,:,1);                            % Hx mode 2
+            EM_fields_mode_2(:,:,4,i) = amplitude_mode_2(:,:,2);                            % Hy mode 2
+            neff_jcm(:,i) = (results{1}.eigenvalues.effective_refractive_index(1:2));       % get n_eff1
+            guess = real(neff_jcm(i));                                                      % set guess for next iteration
+        end
+        % em_field = JCM_solve_fields(N,alpha_max,alpha_t,guess,sizes(1),sizes(2))
+        save('EM_fields_mode_1.mat','EM_fields_mode_1');
+        save('EM_fields_mode_2.mat','EM_fields_mode_2');
+        save('neff_jcm.mat','neff_jcm');
+        break;
+    elseif answer == 2
+        %---loaded from jcm---%
+        temp = matfile('amplitude.mat');
+        amplitude = temp.amplitude;
+        temp = matfile('EM_fields_mode_1.mat');
+        EM_fields_mode_1 = temp.EM_fields_mode_1; 
+        temp = matfile('EM_fields_mode_2.mat');
+        EM_fields_mode_2 = temp.EM_fields_mode_2;
+        temp = matfile('neff_jcm.mat');
+        neff_jcm = temp.neff_jcm;
+        temp = matfile('clims.mat');
+        clims = temp.clims;
+        sizes = size(amplitude);
+        x = linspace(0, 1, sizes(1));
+        y = linspace(0, 1, sizes(2));
+        %---------------------%
+        break;
+    else
+        disp('Invalid input. Please enter 1 or 2.');
+        
+    end
+end
+
+%-----------------------------Data generation-----------------------------%
+%% Calculate bi-refringance and propagation constants
+beta_jcm = neff_jcm*(2*pi/lambda);
+beta_non_twisted = [neff_jcm(1,1)*(2*pi/lambda) neff_jcm(2,1)*(2*pi/lambda)];   % beta_H, beta_V
+lambda_biref = beta_non_twisted(1)-beta_non_twisted(2);
+
+%% Jones vecotrs calculation from jcm simulation
+xc = linspace(0,width*3*10^-6,sizes(1));
+yc = linspace(0,height*1*10^-6,sizes(2));                                            
+jones_jcm = jones_jcm_calc(EM_fields_mode_1,EM_fields_mode_2,xc,yc);     % johns vector for mode 1 and 2
+jones_mode_1_jcm = squeeze(jones_jcm(1,:,:)); 
+jones_mode_2_jcm = squeeze(jones_jcm(2,:,:));
+
+%% Johns vecotrs calculation from Perturbation theory
+psi = atan(2*alpha_t/lambda_biref);
+H = zeros(2,N);
+H(1,:) = ones(1,N);                                                                 % horizontal polarization johns
+V = zeros(2,N);
+V(2,:) = ones(1,N);                                                                 % vertical polarization johns
+
+jones_mode_1_pert = cos(psi/2).*H + 1i*sin(psi/2).*V;                               % first mode johns vector
+jones_mode_2_pert = 1i*sin(psi/2).*H + cos(psi/2).*V;                               % second mode johns vector
+
+
+%% Stokes vector calculation from jcm simulation and perturbation theory
+stokes_mode_1_jcm = jones_to_stokes(jones_mode_1_jcm);
+stokes_mode_2_jcm = jones_to_stokes(jones_mode_2_jcm);
+stokes_mode_1_pert = jones_to_stokes(jones_mode_1_pert);
+stokes_mode_2_pert = jones_to_stokes(jones_mode_2_pert);
+
+stokes_jcm = zeros(4,N,2);                                               % i=num of stokes parameters, j=numel(twist rates), k=modes
+stokes_jcm(:,:,1) = jones_to_stokes(jones_mode_1_jcm);
+stokes_jcm(:,:,2) = stokes_mode_2_jcm;
+stokes_pert = zeros(4,N,2);                                              % i=num of stokes parameters, j=numel(twist rates), k=modes
+stokes_pert(:,:,1) = stokes_mode_1_pert;
+stokes_pert(:,:,2) = stokes_mode_2_pert;
+%% neff results
+% from JCM
+% from perturbation calculation
+beta_pert = beta_pert_calc(beta_non_twisted,alpha_t,N);
+neff_pert = beta_pert*(lambda/(2*pi));
+
+%-----------------------------Data comparison-----------------------------%
+%% test for all untwisted fields of first and second mode (sanity check)
+untwisted_jcm_fields_view(EM_fields_mode_1, EM_fields_mode_2, clims,x,y);
+
+%% neff and phase errors
+plot_neff_phase_errors(neff_jcm, neff_pert, lambda, alpha_t,l_arr);
+
+%% poincare sphere
+% modes 1 and 2 from simulation
+color = ['b', 'r'];
+figure;
+subplot(121);
+for j=1:2
+    plot_poincare_sphere(stokes_jcm(2,:,j),stokes_jcm(3,:,j),stokes_jcm(4,:,j),color(j));
+end
+title(sprintf('Mode 1 (blue) and 2 (red) from JCM'));
+
+% modes 1 and 2 from perturbation theory analytical calculations
+subplot(122);
+for j=1:2
+    plot_poincare_sphere(stokes_pert(2,:,j),stokes_pert(3,:,j),stokes_pert(4,:,j),color(j));
+end
+title(sprintf('Mode 1 (blue) and 2 (red) from perturbation theory'));
+
+%% norm2 error of stokes vectors
+plot_norm2_errors(alpha_t ,stokes_jcm, stokes_pert)
